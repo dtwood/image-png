@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::result;
 use std::fmt;
 use std::error;
+use std::io::Read;
 
 use chunk;
 use crc::Crc32;
@@ -65,7 +66,14 @@ impl<W: Write> Encoder<W> {
             info: info
         }
     }
-    
+
+    pub fn new_with_info(w: W, info: Info) -> Encoder<W> {
+        Encoder {
+            w: w,
+            info: info,
+        }
+    }
+
     pub fn write_header(self) -> Result<Writer<W>> {
         Writer::new(
             self.w,
@@ -126,27 +134,38 @@ impl<W: Write> Writer<W> {
     }
     
     /// Writes the image data.
-    pub fn write_image_data(&mut self, data: &[u8]) -> Result<()> {
+    pub fn write_image_data<T: Read>(&mut self, mut data: T) -> Result<()> {
         let bpp = self.info.bytes_per_pixel();
         let in_len = self.info.raw_row_length() - 1;
         let mut prev = vec![0; in_len];
         let mut current = vec![0; in_len];
-        if data.len() < in_len * self.info.height as usize {
-            return Err(EncodingError::Format(
-                "not enought image data provided".into()
-            ))
-        }
+        let mut prev = &mut prev;
+        let mut current = &mut current;
+
         let mut zlib = flate2::write::ZlibEncoder::new(
             Vec::new(),
             flate2::Compression::Fast
         );
+
         let filter_method = FilterType::Sub;
-        for line in data.chunks(in_len) {
-            ::utils::copy_memory(&line, &mut current);
+
+        loop {
+            match data.read(current) {
+                Ok(x) if x == in_len => (),
+                Ok(0) => break,
+                Ok(_) =>
+                    return Err(EncodingError::Format(
+                        "not enought image data provided".into()
+                    )),
+                Err(_) => panic!(),
+            }
+
             try!(zlib.write_all(&[filter_method as u8]));
-            filter(filter_method, bpp, &prev, &mut current);
-            try!(zlib.write_all(&current));
-            ::utils::copy_memory(&current, &mut prev);
+
+            filter(filter_method, bpp, &prev, current);
+            try!(zlib.write_all(current));
+
+            ::std::mem::swap(&mut current, &mut prev);
         }
         self.write_chunk(chunk::IDAT, &try!(zlib.finish()))
     }
@@ -170,7 +189,7 @@ fn roundtrip() {
     let mut out = Vec::new();
     {
         let mut encoder = Encoder::new(&mut out, info.width, info.height).write_header().unwrap();
-        encoder.write_image_data(&buf).unwrap();
+        encoder.write_image_data(&buf as &[u8]).unwrap();
     }
     // Decode encoded decoded image
     let decoder = ::Decoder::new(&*out);
